@@ -1,0 +1,592 @@
+Index: /Users/kasper/Sites/typo3/TYPO3core/t3lib/class.t3lib_befunc.php
+===================================================================
+--- /Users/kasper/Sites/typo3/TYPO3core/t3lib/class.t3lib_befunc.php	(revision 2514)
++++ /Users/kasper/Sites/typo3/TYPO3core/t3lib/class.t3lib_befunc.php	(working copy)
+@@ -172,6 +172,7 @@
+  */
+ 
+ require_once (PATH_t3lib.'class.t3lib_loaddbgroup.php');
++require_once (PATH_t3lib.'class.t3lib_locking.php');
+ 
+ 
+ /**
+@@ -2743,6 +2744,8 @@
+ 	 * @see t3lib_transferData::lockRecord(), alt_doc.php, db_layout.php, db_list.php, wizard_rte.php
+ 	 */
+ 	function lockRecords($table='',$uid=0,$pid=0)	{
++		if ($GLOBALS['TYPO3_CONF_VARS']['BE']['recordLockingMode'])	return FALSE;	// If recordLockingMode is set, let t3lib_locking handle it!
++		
+ 		$user_id = intval($GLOBALS['BE_USER']->user['uid']);
+ 		if ($table && $uid)	{
+ 			$fields_values = array(
+@@ -2773,30 +2776,39 @@
+ 	 */
+ 	function isRecordLocked($table,$uid)	{
+ 		global $LOCKED_RECORDS;
+-		if (!is_array($LOCKED_RECORDS))	{
+-			$res = $GLOBALS['TYPO3_DB']->exec_SELECTquery(
+-							'*',
+-							'sys_lockedrecords',
+-							'sys_lockedrecords.userid!='.intval($GLOBALS['BE_USER']->user['uid']).'
+-								AND sys_lockedrecords.tstamp > '.($GLOBALS['EXEC_TIME']-2*3600)
+-						);
+-			while($row = $GLOBALS['TYPO3_DB']->sql_fetch_assoc($res))	{
+-				$LOCKED_RECORDS[$row['record_table'].':'.$row['record_uid']]=$row;
+-				$LOCKED_RECORDS[$row['record_table'].':'.$row['record_uid']]['msg']=sprintf(
+-					$GLOBALS['LANG']->sL('LLL:EXT:lang/locallang_core.php:labels.lockedRecord'),
+-					$row['username'],
+-					t3lib_BEfunc::calcAge($GLOBALS['EXEC_TIME']-$row['tstamp'],$GLOBALS['LANG']->sL('LLL:EXT:lang/locallang_core.php:labels.minutesHoursDaysYears'))
+-				);
+-				if ($row['record_pid'] && !isset($LOCKED_RECORDS[$row['record_table'].':'.$row['record_pid']]))	{
+-					$LOCKED_RECORDS['pages:'.$row['record_pid']]['msg']=sprintf(
+-						$GLOBALS['LANG']->sL('LLL:EXT:lang/locallang_core.php:labels.lockedRecord_content'),
++
++		if ($GLOBALS['TYPO3_CONF_VARS']['BE']['recordLockingMode'])	{	// If recordLockingMode is set, let t3lib_locking handle it!
++			$lockObj = t3lib_div::makeInstance('t3lib_locking');
++			$locks = $lockObj->is_locked($table,$uid);
++			if (is_array($locks) && count($locks))	{
++				return array('msg' => 'Was locked by: '.implode(' / ',array_keys($locks)));
++			}
++		} else {
++			if (!is_array($LOCKED_RECORDS))	{
++				$res = $GLOBALS['TYPO3_DB']->exec_SELECTquery(
++								'*',
++								'sys_lockedrecords',
++								'sys_lockedrecords.userid!='.intval($GLOBALS['BE_USER']->user['uid']).'
++									AND sys_lockedrecords.tstamp > '.($GLOBALS['EXEC_TIME']-2*3600)
++							);
++				while($row = $GLOBALS['TYPO3_DB']->sql_fetch_assoc($res))	{
++					$LOCKED_RECORDS[$row['record_table'].':'.$row['record_uid']]=$row;
++					$LOCKED_RECORDS[$row['record_table'].':'.$row['record_uid']]['msg']=sprintf(
++						$GLOBALS['LANG']->sL('LLL:EXT:lang/locallang_core.php:labels.lockedRecord'),
+ 						$row['username'],
+ 						t3lib_BEfunc::calcAge($GLOBALS['EXEC_TIME']-$row['tstamp'],$GLOBALS['LANG']->sL('LLL:EXT:lang/locallang_core.php:labels.minutesHoursDaysYears'))
+ 					);
++					if ($row['record_pid'] && !isset($LOCKED_RECORDS[$row['record_table'].':'.$row['record_pid']]))	{
++						$LOCKED_RECORDS['pages:'.$row['record_pid']]['msg']=sprintf(
++							$GLOBALS['LANG']->sL('LLL:EXT:lang/locallang_core.php:labels.lockedRecord_content'),
++							$row['username'],
++							t3lib_BEfunc::calcAge($GLOBALS['EXEC_TIME']-$row['tstamp'],$GLOBALS['LANG']->sL('LLL:EXT:lang/locallang_core.php:labels.minutesHoursDaysYears'))
++						);
++					}
+ 				}
+ 			}
++			return $LOCKED_RECORDS[$table.':'.$uid];
+ 		}
+-		return $LOCKED_RECORDS[$table.':'.$uid];
+ 	}
+ 
+ 	/**
+Index: /Users/kasper/Sites/typo3/TYPO3core/t3lib/class.t3lib_locking.php
+===================================================================
+--- /Users/kasper/Sites/typo3/TYPO3core/t3lib/class.t3lib_locking.php	(revision 0)
++++ /Users/kasper/Sites/typo3/TYPO3core/t3lib/class.t3lib_locking.php	(revision 0)
+@@ -0,0 +1,303 @@
++<?php
++/***************************************************************
++*  Copyright notice
++*
++*  (c) 2007 Kasper Skaarhoj (kasperYYYY@typo3.com)
++*  All rights reserved
++*
++*  This script is part of the TYPO3 project. The TYPO3 project is
++*  free software; you can redistribute it and/or modify
++*  it under the terms of the GNU General Public License as published by
++*  the Free Software Foundation; either version 2 of the License, or
++*  (at your option) any later version.
++*
++*  The GNU General Public License can be found at
++*  http://www.gnu.org/copyleft/gpl.html.
++*  A copy is found in the textfile GPL.txt and important notices to the license
++*  from the author is found in LICENSE.txt distributed with these scripts.
++*
++*
++*  This script is distributed in the hope that it will be useful,
++*  but WITHOUT ANY WARRANTY; without even the implied warranty of
++*  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++*  GNU General Public License for more details.
++*
++*  This copyright notice MUST APPEAR in all copies of the script!
++***************************************************************/
++/**
++ * Contains class for hard locking
++ *
++ * $Id: $
++ * @author	Kasper Skaarhoj <kasperYYYY@typo3.com>
++ */
++/**
++ * [CLASS/FUNCTION INDEX of SCRIPT]
++ *
++ *
++ *
++ *   71: class t3lib_locking
++ *   80:     function t3lib_locking()
++ *   97:     function is_locked($table,$uid,$ignoreOwnLocks=TRUE)
++ *  148:     function lock($table,$uid)
++ *  180:     function unlock($table,$uid,$onlyUnlockOwnLocks=TRUE)
++ *
++ *              SECTION: Utility functions:
++ *  216:     function getLocks($table,$uid,$ignoreOwnLocks)
++ *
++ * TOTAL FUNCTIONS: 5
++ * (This index is automatically created/updated by the extension "extdeveval")
++ *
++ */
++
++
++
++
++
++
++
++
++
++
++
++
++
++/**
++ * Hard locking features
++ *
++ * @author	Kasper Skaarhoj <kasperYYYY@typo3.com>
++ * @package TYPO3
++ * @subpackage t3lib
++ */
++class t3lib_locking {
++
++
++
++	var $mode = '';
++
++	/**
++	 * Constructor, setting ->mode to the value of $GLOBALS['TYPO3_CONF_VARS']['BE']['recordLockingMode'] if that is either "single" or "extended"
++	 *
++	 * @return	void
++	 */
++	function t3lib_locking()	{
++		switch((string)$GLOBALS['TYPO3_CONF_VARS']['BE']['recordLockingMode'])	{
++			case 'single':
++			case 'extended':
++				$this->mode = (string)$GLOBALS['TYPO3_CONF_VARS']['BE']['recordLockingMode'];
++			break;
++		}
++	}
++	
++	/**
++	 * Checking if a record is lock (either itself or any other records its locking depends on according to configuration of "extendedLocking" / $this->mode=extended)
++	 *
++	 * @param	string		Table name
++	 * @param	integer		UID of record to check
++	 * @return	mixed		Returns FALSE if no locks, returns array with locks if any.
++	 */
++	function is_locked($table,$uid)	{
++		if (!$this->mode)	return FALSE;
++
++		$locks = $this->getAllLocks($table,$uid);
++		if (is_array($locks) && count($locks))	{
++			return $locks;
++		}
++		
++			// In case of explicit locking we must check if the record is locked by ourselves. This we can do with another look up with $ignoreOwnLocks set FALSE which - if true - confirms that:
++		if ($GLOBALS['TYPO3_CONF_VARS']['BE']['recordLockingExplicit'])	{
++			if ($this->getAllLocks($table,$uid,FALSE))	{
++				// OK,
++				return FALSE;
++			} else {
++				return array('NO_EXPLICIT_LOCK' => TRUE);
++			}
++		}
++	}
++	
++	/**
++	 * Locks a record (and removes any other lock if found)
++	 * (It is assumed that this function is called only if a check has already been done with ->is_locked() that the user is allowed to edit this record.)
++	 *
++	 * @param	string		Table name
++	 * @param	integer		Record UID
++	 * @return	void
++	 */
++	function lock($table,$uid)	{
++		if (!$this->mode)	return FALSE;
++
++		if ($table && $uid)	{
++
++				// First, delete existing if any:
++			$GLOBALS['TYPO3_DB']->exec_DELETEquery(
++				'sys_lockedrecords',
++				'record_table='.$GLOBALS['TYPO3_DB']->fullQuoteStr($table, 'sys_lockedrecords').
++					' AND record_uid='.intval($uid));
++
++				// Insert new lock:
++			$fields_values = array(
++				'userid' => intval($GLOBALS['BE_USER']->user['uid']),
++				'tstamp' => $GLOBALS['EXEC_TIME'],
++				'record_table' => $table,
++				'record_uid' => $uid,
++				'username' => $GLOBALS['BE_USER']->user['username']
++			);
++			$GLOBALS['TYPO3_DB']->exec_INSERTquery('sys_lockedrecords', $fields_values);
++		}
++	}
++
++	/**
++	 * Removes locks for record
++	 *
++	 * @param	string		Table name
++	 * @param	integer		Record UID
++	 * @param	boolean		If set, will only remove lock if owned by user
++	 * @return	void
++	 */
++	function unlock($table,$uid,$onlyUnlockOwnLocks=TRUE)	{
++		if (!$this->mode)	return FALSE;
++
++		if ($table && $uid)	{
++
++				// First, delete existing if any:
++			$GLOBALS['TYPO3_DB']->exec_DELETEquery(
++				'sys_lockedrecords',
++				'record_table='.$GLOBALS['TYPO3_DB']->fullQuoteStr($table, 'sys_lockedrecords').
++					' AND record_uid='.intval($uid).
++					($onlyUnlockOwnLocks ? ' AND userid='.intval($GLOBALS['BE_USER']->user['uid']) : '')
++			);
++		}
++	}
++
++
++
++
++
++
++
++
++
++
++	/**************************
++	 *
++	 * Utility functions:
++	 *
++	 **************************/
++
++	/**
++	 * Getting lock records for table/uid and all versions it has in workspace (depends on configuration)
++	 *
++	 * @param	string		Table name
++	 * @param	integer		UID of record to check
++	 * @param	boolean		If set, will ignore locks set by self.
++	 * @return	array		Array of lock records with table:uid as key
++	 */
++	function getLocks($table,$uid,$ignoreOwnLocks)	{
++		
++			// Workspace set up:
++		if ($GLOBALS['TYPO3_CONF_VARS']['BE']['recordLockingAcrossWS'])	{
++			$workspace = 0;	// Will select across all workspaces!
++		} else {
++			$workspace = $GLOBALS['BE_USER']->workspace;
++			if (!$GLOBALS['BE_USER']->workspace)	{	// In case we are in Live workspace and recordLockingAcrossWS is not set, we deal only with the live record (which is the one assumed as the input ID then)
++				return $this->getLocksForRecord($table,$uid,$ignoreOwnLocks);
++			}
++		}
++		
++			// Select all versions:
++		$allRecs = t3lib_BEfunc::selectVersionsOfRecord($table, $uid, 'uid', $workspace);
++		$locks = array();
++		foreach($allRecs as $r)	{
++			if ($tmpLocks = $this->getLocksForRecord($table,$r['uid'],$ignoreOwnLocks))	{
++				$locks = array_merge($locks,$tmpLocks);
++			}
++		}
++
++		return $locks;
++	}
++	
++	/**
++	 * Getting lock records for table/uid
++	 *
++	 * @param	string		Table name
++	 * @param	integer		UID of record to check
++	 * @param	boolean		If set, will ignore locks set by self.
++	 * @return	array		Array of lock records with table:uid as key
++	 */
++	function getLocksForRecord($table,$uid,$ignoreOwnLocks)	{
++		$locks = $GLOBALS['TYPO3_DB']->exec_SELECTgetRows(
++			'*',
++			'sys_lockedrecords',
++			'record_table='.$GLOBALS['TYPO3_DB']->fullQuoteStr($table, 'sys_lockedrecords').
++				' AND record_uid='.intval($uid).
++				($ignoreOwnLocks ? ' AND userid!='.intval($GLOBALS['BE_USER']->user['uid']) : '')
++		);
++
++		$output = array();
++		foreach($locks as $l)	{
++			$output[$l['record_table'].':'.$l['record_uid']] = $l;
++		}
++		return $output;
++	}
++	
++	/**
++	 * Checking if a record is lock (either itself or any other records its locking depends on according to configuration of "extendedLocking" / $this->mode=extended)
++	 *
++	 * @param	string		Table name
++	 * @param	integer		UID of record to check
++	 * @param	boolean		If set, will ignore locks set by self.
++	 * @return	mixed		Returns FALSE if no locks, returns array with locks if any.
++	 */
++	function getAllLocks($table,$uid,$ignoreOwnLocks=TRUE)	{
++		if (!$this->mode)	return FALSE;
++		
++		$locks = array();
++		if (!$GLOBALS['TCA'][$table]['ctrl']['extendedLocking'] || $this->mode=='single')	{
++			$locks = $this->getLocks($table,$uid,$ignoreOwnLocks);
++		} elseif ($this->mode=='extended')	{	// Implicit that extendedLocking is set for this table then...
++			
++				// Find PID value to look up siblings from:
++			if ($table=='pages')	{
++				$checkPID = $uid;
++			} else {
++				$rec = t3lib_BEfunc::getRecord($table,$uid,'pid');
++				if ($rec['pid']<0)	{
++					if ($rec = t3lib_BEfunc::getLiveVersionOfRecord($table,$uid,'pid'))	{
++						$checkPID = $rec['pid'];
++					} else return 'WEIRD ERROR!!';
++				} else $checkPID = $rec['pid'];
++			}
++
++				// Traverse all tables and check records:
++			$allTables = array_keys($GLOBALS['TCA']);
++			foreach($allTables as $newTable)	{
++				if ($GLOBALS['TCA'][$newTable]['ctrl']['extendedLocking'])	{
++					
++						// Select records from each table with "extendedLocking" set:
++					if ($newTable!='pages')	{
++							// Select records from table on this page:
++						$recs = $GLOBALS['TYPO3_DB']->exec_SELECTgetRows(
++							'uid',
++							$newTable,
++							'pid='.intval($checkPID).t3lib_BEfunc::deleteClause($newTable)
++						);
++					} else {
++						$recs = array(array('uid' => $checkPID));
++					}
++
++						// For each record, check for a lock (like single):
++					foreach($recs as $r)	{
++						$tmp_locks = $this->getLocks($newTable,$r['uid'],$ignoreOwnLocks);
++						if (count($tmp_locks))	$locks = array_merge($locks,$tmp_locks);
++					}
++				}
++			}
++		}
++		return count($locks) ? $locks : FALSE;
++	}	
++}
++
++
++if (defined('TYPO3_MODE') && $TYPO3_CONF_VARS[TYPO3_MODE]['XCLASS']['t3lib/class.t3lib_locking.php'])	{
++	include_once($TYPO3_CONF_VARS[TYPO3_MODE]['XCLASS']['t3lib/class.t3lib_locking.php']);
++}
++?>
+\ No newline at end of file
+
+Property changes on: /Users/kasper/Sites/typo3/TYPO3core/t3lib/class.t3lib_locking.php
+___________________________________________________________________
+Name: svn:executable
+   + *
+
+Index: /Users/kasper/Sites/typo3/TYPO3core/t3lib/class.t3lib_tcemain.php
+===================================================================
+--- /Users/kasper/Sites/typo3/TYPO3core/t3lib/class.t3lib_tcemain.php	(revision 2515)
++++ /Users/kasper/Sites/typo3/TYPO3core/t3lib/class.t3lib_tcemain.php	(working copy)
+@@ -787,6 +787,7 @@
+ 													foreach ($origIdArray as $origId => $newId) {
+ 														$this->uploadedFileArray[$origTable][$newId] = $this->uploadedFileArray[$origTable][$origId];
+ 														$this->autoVersionIdMap[$origTable][$origId] = $newId;
++														$this->unlock($origTable,$origId);
+ 													}
+ 												}
+ 												$this->RTEmagic_copyIndex = t3lib_div::array_merge_recursive_overrule($this->RTEmagic_copyIndex, $tce->RTEmagic_copyIndex);		// See where RTEmagic_copyIndex is used inside fillInFieldArray() for more information...
+@@ -4925,6 +4926,40 @@
+ 		}
+ 		return $res;
+ 	}
++	
++	/**
++	 * Check locking (if recordLockingMode is set)
++	 *
++	 * @param	string	Tablename
++ 	 * @param	integer	UID of record
++	 * @return 	mixed	Returns array with locks if locked, otherwise false
++	 */
++	function isLocked($table,$id)	{
++			// Check locks:
++		if ($GLOBALS['TYPO3_CONF_VARS']['BE']['recordLockingMode'])	{
++			$lockObj = t3lib_div::makeInstance('t3lib_locking');
++			$locks = $lockObj->is_locked($table,$id);
++			if (is_array($locks) && count($locks))	{
++				return $locks;
++			}
++		}		
++		return FALSE;
++	}
++	
++	/**
++	 * Check locking (if recordLockingMode is set)
++	 *
++	 * @param	string	Tablename
++ 	 * @param	integer	UID of record
++	 * @return 	mixed	Returns array with locks if locked, otherwise false
++	 */
++	function unlock($table,$id)	{
++			// Check locks:
++		if ($GLOBALS['TYPO3_CONF_VARS']['BE']['recordLockingMode'] && !$GLOBALS['TYPO3_CONF_VARS']['BE']['recordLockingExplicit'])	{
++			$lockObj = t3lib_div::makeInstance('t3lib_locking');
++			$lockObj->unlock($table,$id);
++		}		
++	}
+ 
+ 	/**
+ 	 * Checks if a table is allowed on a certain page id according to allowed tables set for the page "doktype" and its [ctrl][rootLevel]-settings if any.
+@@ -4994,6 +5029,12 @@
+ 
+ 		if (!$perms)	{die('Internal ERROR: no permissions to check for non-admin user.');}
+ 
++			// Check locks:
++		if ($perms > 1 && $locks = $this->isLocked($table,$id))	{	// If perms larger than "show" (1) is checked for, then check:
++			$this->newLog('doesRecordExist(),perms='.$perms.': '.$table.':'.$id.' was locked by: '.implode(' / ',array_keys($locks)), 1);
++			return FALSE;
++		}
++
+ 			// For all tables: Check if record exists:
+ 		if (is_array($TCA[$table]) && $id>0 && ($this->isRecordInWebMount($table,$id) || $this->admin))	{
+ 			if ($table != 'pages')	{
+Index: /Users/kasper/Sites/typo3/TYPO3core/t3lib/config_default.php
+===================================================================
+--- /Users/kasper/Sites/typo3/TYPO3core/t3lib/config_default.php	(revision 2515)
++++ /Users/kasper/Sites/typo3/TYPO3core/t3lib/config_default.php	(working copy)
+@@ -171,6 +171,9 @@
+ 		'flexFormXMLincludeDiffBase' => TRUE,	// If set, an additional tag with index "vXX.vDEFbase" is created for translations in flexforms holding the value of the default language when translation was changed. Used to show diff of value. This setting will change whether the system thinks flexform XML looks clean. For example when FALSE XX.vDEFbase fields will be removed in cleaning while accepted if TRUE (of course)
+ 		'compactFlexFormXML' => 0,				// If set, the flexform XML will not contain indentation spaces making XML more compact
+ 		'elementVersioningOnly' => FALSE,		// If true, only element versioning is allowed in the backend. This is recommended for new installations of TYPO3 4.2+ since "page" and "branch" versioning types are known for the drawbacks of loosing ids and "element" type versions supports moving now.
++		'recordLockingMode' => 'single',		// Mode of record locking. Default is "advisory" which only shows a warning (as TYPO3 has been for years). Keyword "single" activates "hard"-locking (records cannot be edited by other users) and keyword "extended" even activates "hard"-locking of all records on the page which has [ctrl][extendedLocking] set (if the record to be locked also has this setting - otherwise it acts like "single")
++		'recordLockingExplicit' => FALSE,		// Relevant only if "recordLockingMode" is set; If set, locking of records must be done manually (default is that TCEforms locks the record and clears the lock during exit)
++		'recordLockingAcrossWS' => FALSE,		// Relevant only if "recordLockingMode" is set; If set, looking for locks will be done across all workspaces. By default it is done only in the current workspaces versions.
+ 	),
+ 	'FE' => Array(			// Configuration for the TypoScript frontend (FE). Nothing here relates to the administration backend!
+ 		'png_to_gif' => 0,						// Boolean. Enables conversion back to gif of all png-files generated in the frontend libraries. Notice that this leaves an increased number of temporary files in typo3temp/
+Index: /Users/kasper/Sites/typo3/TYPO3core/typo3/alt_doc.php
+===================================================================
+--- /Users/kasper/Sites/typo3/TYPO3core/typo3/alt_doc.php	(revision 2514)
++++ /Users/kasper/Sites/typo3/TYPO3core/typo3/alt_doc.php	(working copy)
+@@ -510,7 +510,6 @@
+ 
+ 			// Begin edit:
+ 		if (is_array($this->editconf))	{
+-			
+ 				// Initialize TCEforms (rendering the forms)
+ 			$this->tceforms = t3lib_div::makeInstance('t3lib_TCEforms');
+ 			$this->tceforms->initDefaultBEMode();
+@@ -697,6 +696,11 @@
+ 										$hasAccess = $BE_USER->recordEditAccessInternals($table, $calcPRec);
+ 										$deniedAccessReason = $BE_USER->errorMsg;
+ 									}
++										
++										// Check locking (and possibly set)
++									if ($this->isLocked($table,$theUid))	{
++										$hasAccess = 0;
++									} else $this->setLock($table,$theUid);
+ 								} else $hasAccess = 0;
+ 							}
+ 
+@@ -1451,6 +1455,9 @@
+ 	 */
+ 	function closeDocument($code=0)	{
+ 		global $BE_USER;
++		
++			// Implicit removing locks:
++		$this->removeLocks(t3lib_div::_GP('data'));
+ 
+ 			// If current document is found in docHandler, then unset it, possibly unset it ALL and finally, write it to the session data:
+ 		if (isset($this->docHandler[$this->storeUrlMd5]))	{
+@@ -1474,6 +1481,61 @@
+ 	}
+ 
+ 	/**
++	 * Check locking (if recordLockingMode is set)
++	 *
++	 * @param	string	Table name
++	 * @param	integer	Record uid
++	 * @return 	mixed	Returns array with locks if locked, otherwise false
++	 */
++	function isLocked($table,$id)	{
++			// Check locks:
++		if ($GLOBALS['TYPO3_CONF_VARS']['BE']['recordLockingMode'])	{
++			$lockObj = t3lib_div::makeInstance('t3lib_locking');
++			$locks = $lockObj->is_locked($table,$id);
++			if (is_array($locks) && count($locks))	{
++				return $locks;
++			}
++		}		
++		return FALSE;
++	}
++
++	/**
++	 * Set locking (if recordLockingMode is set and implicit)
++	 *
++	 * @param	string	Table name
++	 * @param	integer	Record uid
++	 * @return 	void
++	 */
++	function setLock($table,$id)	{
++			// Set lock:
++		if ($GLOBALS['TYPO3_CONF_VARS']['BE']['recordLockingMode'] && !$GLOBALS['TYPO3_CONF_VARS']['BE']['recordLockingExplicit'])	{
++			$lockObj = t3lib_div::makeInstance('t3lib_locking');
++			$lockObj->lock($table,$id);
++		}		
++		return FALSE;
++	}
++
++	/**
++	 * Remove locks from closed records:
++	 *
++	 * @param	array	Input data from which tables and uids are extracted to know which records were in the input form.
++	 * @return  void
++	 */
++	function removeLocks($data)	{
++
++			// Check locks:
++		if (is_array($data) && $GLOBALS['TYPO3_CONF_VARS']['BE']['recordLockingMode'] && !$GLOBALS['TYPO3_CONF_VARS']['BE']['recordLockingExplicit'])	{
++			$lockObj = t3lib_div::makeInstance('t3lib_locking');
++			
++			foreach($data as $table => $dSet)	{
++				foreach($dSet as $uid => $dRec)	{
++					$lockObj->unlock($table,$uid);
++				}
++			}
++		}		
++	}
++	
++	/**
+ 	 * Redirects to the document pointed to by $currentDocFromHandlerMD5 OR $retUrl (depending on some internal calculations).
+ 	 * Most likely you will get a header-location redirect from this function.
+ 	 *
+Index: /Users/kasper/Sites/typo3/TYPO3core/typo3/sysext/cms/ext_tables.php
+===================================================================
+--- /Users/kasper/Sites/typo3/TYPO3core/typo3/sysext/cms/ext_tables.php	(revision 2514)
++++ /Users/kasper/Sites/typo3/TYPO3core/typo3/sysext/cms/ext_tables.php	(working copy)
+@@ -88,6 +88,7 @@
+ 	// Adding default value columns:
+ 	$TCA['pages']['ctrl']['useColumnsForDefaultValues'].=',fe_group,hidden';
+ 	$TCA['pages']['ctrl']['transForeignTable'] = 'pages_language_overlay';
++	$TCA['pages']['ctrl']['extendedLocking'] = TRUE;
+ 
+ 	// Adding new columns:
+ 	$TCA['pages']['columns'] = array_merge($TCA['pages']['columns'],Array(
+@@ -549,7 +550,8 @@
+ 		'mainpalette' => '1,15',
+ 		'thumbnail' => 'image',
+ 		'requestUpdate' => 'list_type',
+-		'dynamicConfigFile' => t3lib_extMgm::extPath($_EXTKEY).'tbl_tt_content.php'
++		'dynamicConfigFile' => t3lib_extMgm::extPath($_EXTKEY).'tbl_tt_content.php',
++		'extendedLocking' => TRUE
+ 	)
+ );
+ 
